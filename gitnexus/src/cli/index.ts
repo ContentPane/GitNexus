@@ -107,6 +107,11 @@ program
   .option('--gist', 'Publish wiki as a public GitHub Gist after generation')
   .option('-v, --verbose', 'Enable verbose output (show LLM commands and responses)')
   .option('--review', 'Stop after grouping to review module structure before generating pages')
+  .option('--modules <names>', 'Comma-separated module names to generate (e.g., "Auth,Services")')
+  .option('--exclude-modules <names>', 'Comma-separated module names to exclude')
+  .option('--all-modules', 'Generate all modules, ignore and delete module_config.json')
+  .option('--list-modules', 'List available modules without generating')
+  .option('--detail', 'Show detailed module file list (use with --list-modules)')
   .action(createLazyAction(() => import('./wiki.js'), 'wikiCommand'));
 
 program

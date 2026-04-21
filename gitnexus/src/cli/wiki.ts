@@ -19,6 +19,13 @@ import {
 import { WikiGenerator, type WikiOptions } from '../core/wiki/generator.js';
 import { resolveLLMConfig, type LLMProvider } from '../core/wiki/llm-client.js';
 import { detectCursorCLI } from '../core/wiki/cursor-client.js';
+import {
+  loadModuleConfig,
+  getAllModuleNames,
+  formatModuleList,
+  type ModuleConfig,
+} from '../core/wiki/module-filter.js';
+import { initWikiDb, closeWikiDb, getFilesWithExports, getAllFiles } from '../core/wiki/graph-queries.js';
 
 export interface WikiCommandOptions {
   force?: boolean;
@@ -32,6 +39,11 @@ export interface WikiCommandOptions {
   provider?: LLMProvider;
   verbose?: boolean;
   review?: boolean;
+  modules?: string;
+  excludeModules?: string;
+  allModules?: boolean;
+  listModules?: boolean;
+  detail?: boolean;
 }
 
 /**
@@ -89,6 +101,12 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
   // Set verbose mode globally for cursor-client to pick up
   if (options?.verbose) {
     process.env.GITNEXUS_VERBOSE = '1';
+  }
+
+  // Handle --list-modules option
+  if (options?.listModules) {
+    await listModulesCommand(inputPath, options);
+    return;
   }
 
   console.log('\n  GitNexus Wiki Generator\n');
@@ -382,6 +400,11 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
     force: options?.force,
     concurrency: options?.concurrency ? parseInt(options.concurrency, 10) : undefined,
     reviewOnly: options?.review,
+    modules: options?.modules ? options.modules.split(',').map((s) => s.trim()) : undefined,
+    excludeModules: options?.excludeModules
+      ? options.excludeModules.split(',').map((s) => s.trim())
+      : undefined,
+    allModules: options?.allModules,
   };
 
   const generator = new WikiGenerator(
@@ -673,3 +696,155 @@ async function maybePublishGist(htmlPath: string, gistFlag?: boolean): Promise<v
     console.log('  Failed to publish gist. Make sure `gh auth login` is configured.\n');
   }
 }
+
+// ─── List Modules Command ───────────────────────────────────────────────
+
+export const listModulesCommand = async (
+  inputPath?: string,
+  options?: WikiCommandOptions,
+) => {
+  console.log('\n  GitNexus Wiki Module List\n');
+
+  let repoPath: string;
+  if (inputPath) {
+    repoPath = path.resolve(inputPath);
+  } else {
+    const gitRoot = getGitRoot(process.cwd());
+    if (!gitRoot) {
+      console.log('  Error: Not inside a git repository\n');
+      process.exitCode = 1;
+      return;
+    }
+    repoPath = gitRoot;
+  }
+
+  if (!isGitRepo(repoPath)) {
+    console.log('  Error: Not a git repository\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  const { storagePath, lbugPath } = getStoragePaths(repoPath);
+  const meta = await loadMeta(storagePath);
+
+  if (!meta) {
+    console.log('  Error: No GitNexus index found.');
+    console.log('  Run `gitnexus analyze` first to index this repository.\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  const wikiDir = path.join(storagePath, 'wiki');
+  const detail = options?.detail ?? false;
+
+  // Try to load existing module tree from previous generation
+  const fs = await import('fs/promises');
+  let moduleTree: any[] | null = null;
+
+  try {
+    const treePath = path.join(wikiDir, 'module_tree.json');
+    const treeContent = await fs.readFile(treePath, 'utf-8');
+    moduleTree = JSON.parse(treeContent);
+  } catch {
+    // No existing module tree, need to query the graph
+  }
+
+  if (moduleTree) {
+    console.log('  Modules (from previous generation):\n');
+    console.log(formatModuleList(moduleTree, detail));
+
+    // Show module config if it exists
+    const moduleConfig = await loadModuleConfig(wikiDir);
+    if (moduleConfig) {
+      console.log('\n  Module configuration:\n');
+      console.log(`    Selected: ${moduleConfig.selectedModules.join(', ')}`);
+      if (moduleConfig.excludedModules.length > 0) {
+        console.log(`    Excluded: ${moduleConfig.excludedModules.join(', ')}`);
+      }
+      console.log(`    Last generated: ${moduleConfig.lastGeneratedAt}`);
+    }
+    console.log('');
+    return;
+  }
+
+  // No existing tree — need to build one via LLM grouping
+  console.log('  No existing module tree. Building module groups...\n');
+
+  // Try to get LLM config
+  let llmConfig;
+  try {
+    llmConfig = await resolveLLMConfig({
+      model: options?.model,
+      baseUrl: options?.baseUrl,
+      apiKey: options?.apiKey,
+      provider: options?.provider,
+      apiVersion: options?.apiVersion,
+      isReasoningModel: options?.reasoningModel,
+    });
+  } catch {
+    // Config parsing failed
+  }
+
+  // Check if we have a valid LLM config
+  if (!llmConfig?.apiKey && llmConfig?.provider !== 'cursor') {
+    console.log('  Error: LLM configuration required for module grouping.\n');
+    console.log('  Options:');
+    console.log('    - Set OPENAI_API_KEY or GITNEXUS_API_KEY environment variable');
+    console.log('    - Pass --api-key <key> --provider <provider>');
+    console.log('    - Use --provider cursor (if Cursor CLI is installed)');
+    console.log('    - Or run `gitnexus wiki` first to configure LLM\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  // Create WikiGenerator with buildTreeOnly mode
+  const wikiOptions: WikiOptions = {
+    buildTreeOnly: true,
+  };
+
+  // Simple progress bar
+  let lastPhase = '';
+  const bar = new cliProgress.SingleBar({
+    format: '  {bar} {percentage}% | {phase}',
+    barCompleteChar: '\u2588',
+    barIncompleteChar: '\u2591',
+    hideCursor: true,
+  });
+  bar.start(100, 0, { phase: 'Initializing...' });
+
+  const generator = new WikiGenerator(
+    repoPath,
+    storagePath,
+    lbugPath,
+    llmConfig,
+    wikiOptions,
+    (phase, percent, detail) => {
+      const label = detail || phase;
+      if (label !== lastPhase) {
+        lastPhase = label;
+      }
+      bar.update(percent, { phase: label });
+    },
+  );
+
+  try {
+    await initWikiDb(lbugPath);
+    const result = await generator.run();
+    await closeWikiDb();
+
+    bar.stop();
+
+    if (result.mode === 'tree-only' && result.moduleTree) {
+      console.log('\n\n  Modules:\n');
+      console.log(formatModuleList(result.moduleTree, detail));
+      console.log(`  Tree saved to: ${path.join(wikiDir, 'module_tree.json')}\n`);
+    } else {
+      console.log('\n\n  Error: Failed to build module tree.\n');
+      process.exitCode = 1;
+    }
+  } catch (err: any) {
+    bar.stop();
+    console.log(`\n\n  Error: ${err.message}\n`);
+    process.exitCode = 1;
+  }
+};

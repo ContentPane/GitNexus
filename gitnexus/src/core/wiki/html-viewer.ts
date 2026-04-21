@@ -17,16 +17,33 @@ interface ModuleTreeNode {
 
 /**
  * Generate the wiki HTML viewer (index.html) from existing markdown pages.
+ * Only embeds markdown files that are in the module tree.
  */
-export async function generateHTMLViewer(wikiDir: string, projectName: string): Promise<string> {
-  // Load module tree
-  let moduleTree: ModuleTreeNode[] = [];
-  try {
-    const raw = await fs.readFile(path.join(wikiDir, 'module_tree.json'), 'utf-8');
-    moduleTree = JSON.parse(raw);
-  } catch {
-    /* will show empty nav */
+export async function generateHTMLViewer(
+  wikiDir: string,
+  projectName: string,
+  moduleTree?: ModuleTreeNode[],
+): Promise<string> {
+  // Load module tree from argument or file
+  let tree: ModuleTreeNode[] = moduleTree || [];
+  if (tree.length === 0) {
+    try {
+      const raw = await fs.readFile(path.join(wikiDir, 'module_tree.json'), 'utf-8');
+      tree = JSON.parse(raw);
+    } catch {
+      /* will show empty nav */
+    }
   }
+
+  // Collect valid slugs from tree
+  const validSlugs = new Set<string>();
+  const collectSlugs = (nodes: ModuleTreeNode[]) => {
+    for (const node of nodes) {
+      validSlugs.add(node.slug);
+      if (node.children) collectSlugs(node.children);
+    }
+  };
+  collectSlugs(tree);
 
   // Load meta
   let meta: Record<string, unknown> | null = null;
@@ -37,15 +54,18 @@ export async function generateHTMLViewer(wikiDir: string, projectName: string): 
     /* no meta */
   }
 
-  // Read all markdown files into a { slug: content } map
+  // Read markdown files - only those in moduleTree + overview
   const pages: Record<string, string> = {};
   const dirEntries = await fs.readdir(wikiDir);
   for (const f of dirEntries.filter((f) => f.endsWith('.md'))) {
-    const content = await fs.readFile(path.join(wikiDir, f), 'utf-8');
-    pages[f.replace(/\.md$/, '')] = content;
+    const slug = f.replace(/\.md$/, '');
+    if (validSlugs.has(slug) || slug === 'overview') {
+      const content = await fs.readFile(path.join(wikiDir, f), 'utf-8');
+      pages[slug] = content;
+    }
   }
 
-  const html = buildHTML(projectName, moduleTree, pages, meta);
+  const html = buildHTML(projectName, tree, pages, meta);
   const outputPath = path.join(wikiDir, 'index.html');
   await fs.writeFile(outputPath, html, 'utf-8');
   return outputPath;

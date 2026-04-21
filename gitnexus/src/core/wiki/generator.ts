@@ -57,6 +57,14 @@ import {
 
 import { shouldIgnorePath } from '../../config/ignore-service.js';
 
+import {
+  loadModuleConfig,
+  saveModuleConfig,
+  deleteModuleConfig,
+  applyModuleFilterWithPrompts,
+  getAllModuleNames,
+} from './module-filter.js';
+
 // ─── Types ────────────────────────────────────────────────────────────
 
 export interface WikiOptions {
@@ -65,6 +73,14 @@ export interface WikiOptions {
   concurrency?: number;
   /** If true, stop after building module tree for user review */
   reviewOnly?: boolean;
+  /** Specific modules to generate (comma-separated names) */
+  modules?: string[];
+  /** Modules to exclude from generation */
+  excludeModules?: string[];
+  /** Generate all modules, ignore and delete module_config.json */
+  allModules?: boolean;
+  /** If true, build module tree only without generating pages */
+  buildTreeOnly?: boolean;
 }
 
 export interface WikiMeta {
@@ -86,7 +102,7 @@ export type ProgressCallback = (phase: string, percent: number, detail?: string)
 
 export interface WikiRunResult {
   pagesGenerated: number;
-  mode: 'full' | 'incremental' | 'up-to-date';
+  mode: 'full' | 'incremental' | 'up-to-date' | 'tree-only';
   failedModules: string[];
   moduleTree?: ModuleTreeNode[];
 }
@@ -216,13 +232,16 @@ export class WikiGenerator {
       try {
         await fs.unlink(path.join(this.wikiDir, 'first_module_tree.json'));
       } catch {}
-      // Delete existing module pages so they get regenerated
-      const existingFiles = await fs.readdir(this.wikiDir).catch(() => [] as string[]);
-      for (const f of existingFiles) {
-        if (f.endsWith('.md')) {
-          try {
-            await fs.unlink(path.join(this.wikiDir, f));
-          } catch {}
+      // Only delete all .md files if no module selection specified
+      // Otherwise, orphan docs detection will prompt user later
+      if (!this.options.modules && !this.options.excludeModules) {
+        const existingFiles = await fs.readdir(this.wikiDir).catch(() => [] as string[]);
+        for (const f of existingFiles) {
+          if (f.endsWith('.md')) {
+            try {
+              await fs.unlink(path.join(this.wikiDir, f));
+            } catch {}
+          }
         }
       }
     }
@@ -243,14 +262,14 @@ export class WikiGenerator {
     }
 
     // Always generate the HTML viewer after wiki content changes
-    await this.ensureHTMLViewer();
+    await this.ensureHTMLViewer(result.moduleTree);
 
     return result;
   }
 
   // ─── HTML Viewer ─────────────────────────────────────────────────────
 
-  private async ensureHTMLViewer(): Promise<void> {
+  private async ensureHTMLViewer(moduleTree?: ModuleTreeNode[]): Promise<void> {
     // Only generate if there are markdown pages to bundle
     const dirEntries = await fs.readdir(this.wikiDir).catch(() => [] as string[]);
     const hasMd = dirEntries.some((f) => f.endsWith('.md'));
@@ -258,7 +277,7 @@ export class WikiGenerator {
 
     this.onProgress('html', 98, 'Building HTML viewer...');
     const repoName = path.basename(this.repoPath);
-    await generateHTMLViewer(this.wikiDir, repoName);
+    await generateHTMLViewer(this.wikiDir, repoName, moduleTree);
   }
 
   // ─── Full Generation ────────────────────────────────────────────────
@@ -286,8 +305,66 @@ export class WikiGenerator {
     this.onProgress('gather', 10, `Found ${sourceFiles.length} source files`);
 
     // Phase 1: Build module tree
-    const moduleTree = await this.buildModuleTree(enrichedFiles);
+    const rawModuleTree = await this.buildModuleTree(enrichedFiles);
     pagesGenerated = 0;
+
+    // Phase 1.5: Apply module filter
+    let moduleTree = rawModuleTree;
+    let moduleConfig: import('./module-filter.js').ModuleConfig | null = null;
+
+    const existingConfig = await loadModuleConfig(this.wikiDir);
+
+    // --all-modules: delete config, generate all modules
+    if (this.options.allModules) {
+      this.onProgress('filter', 15, 'Generating all modules (--all-modules)...');
+      await deleteModuleConfig(this.wikiDir);
+      this.onProgress('filter', 20, `${rawModuleTree.length} modules`);
+    } else if (this.options.modules || this.options.excludeModules || existingConfig) {
+      // CLI params OR existing config -> apply filter
+      this.onProgress('filter', 15, 'Applying module filter...');
+      const result = await applyModuleFilterWithPrompts(
+        rawModuleTree,
+        existingConfig,
+        this.options.modules,
+        this.options.excludeModules,
+        this.wikiDir,
+        currentCommit,
+      );
+      moduleTree = result.filteredTree;
+      moduleConfig = result.config;
+
+      if (result.deletedDocs.length > 0) {
+        this.onProgress('filter', 18, `Removed ${result.deletedDocs.length} stale docs`);
+      }
+
+      if (moduleTree.length === 0) {
+        throw new Error('No modules selected for generation.');
+      }
+
+      this.onProgress('filter', 20, `Filtered to ${moduleTree.length} modules`);
+    }
+
+    // Detect orphan docs if modules specified with --force
+    if (this.options.force && (this.options.modules || this.options.excludeModules)) {
+      const {
+        detectOrphanDocs,
+        promptForOrphanDocs,
+        deleteOrphanDocs,
+      } = await import('./module-filter.js');
+
+      const orphanDocs = await detectOrphanDocs(this.wikiDir, moduleTree);
+
+      if (orphanDocs.length > 0) {
+        const result = await promptForOrphanDocs(orphanDocs);
+
+        if (result.confirmedDelete) {
+          const deleted = await deleteOrphanDocs(this.wikiDir, orphanDocs);
+          this.onProgress('cleanup', 22, `Deleted ${deleted.length} orphan docs`);
+        } else if (moduleConfig) {
+          moduleConfig.orphanDocs = orphanDocs;
+        }
+      }
+    }
 
     // If reviewOnly mode, save tree and stop for user to review/edit
     if (this.options.reviewOnly) {
@@ -300,6 +377,13 @@ export class WikiGenerator {
         moduleTree,
       };
       return reviewResult;
+    }
+
+    // If buildTreeOnly mode, save tree and exit without generating pages
+    if (this.options.buildTreeOnly) {
+      await this.saveModuleTree(moduleTree);
+      this.onProgress('tree', 100, 'Module tree built');
+      return { pagesGenerated: 0, mode: 'tree-only', failedModules: [], moduleTree };
     }
 
     // Phase 2: Generate module pages (parallel with concurrency limit)
@@ -693,6 +777,14 @@ export class WikiGenerator {
   ): Promise<WikiRunResult> {
     this.onProgress('incremental', 5, 'Detecting changes...');
 
+    // --all-modules: delete config and run full generation
+    if (this.options.allModules) {
+      this.onProgress('incremental', 8, '--all-modules: running full generation...');
+      await deleteModuleConfig(this.wikiDir);
+      const fullResult = await this.fullGeneration(currentCommit);
+      return { ...fullResult, mode: 'incremental' };
+    }
+
     // Get changed files since last generation
     const changedFiles = this.getChangedFiles(existingMeta.fromCommit, currentCommit);
 
@@ -715,6 +807,68 @@ export class WikiGenerator {
     }
 
     this.onProgress('incremental', 10, `${changedFiles.length} files changed`);
+
+    // Check module config for changes
+    const existingModuleConfig = await loadModuleConfig(this.wikiDir);
+    if (existingModuleConfig) {
+      const { detectModuleChanges, cleanupDeletedModuleDocs } = await import('./module-filter.js');
+      const changes = detectModuleChanges(existingModuleConfig, existingMeta.moduleTree);
+
+      if (changes.newModules.length > 0 || changes.deletedModules.length > 0) {
+        this.onProgress('incremental', 12, 'Module changes detected, prompting user...');
+        const {
+          promptForNewModules,
+          promptForDeletedModules,
+          filterModuleTree,
+        } = await import('./module-filter.js');
+
+        if (changes.newModules.length > 0) {
+          const { added, skipped } = await promptForNewModules(changes.newModules);
+          existingModuleConfig.selectedModules = [...existingModuleConfig.selectedModules, ...added];
+          existingModuleConfig.excludedModules = [...existingModuleConfig.excludedModules, ...skipped];
+        }
+
+        if (changes.deletedModules.length > 0) {
+          const result = await promptForDeletedModules(
+            changes.deletedModules,
+            changes.currentModules,
+            existingModuleConfig.selectedModules,
+          );
+
+          if (!result.confirmedDelete) {
+            console.log('\n  Generation cancelled by user.\n');
+            process.exit(0);
+          }
+
+          existingModuleConfig.selectedModules = result.selectedModules;
+          existingModuleConfig.excludedModules = existingModuleConfig.excludedModules.filter(
+            (n) => !changes.deletedModules.includes(n),
+          );
+
+          const cleaned = await cleanupDeletedModuleDocs(
+            this.wikiDir,
+            changes.deletedModules,
+            existingMeta.moduleTree,
+          );
+          if (cleaned.length > 0) {
+            this.onProgress('incremental', 14, `Removed ${cleaned.length} stale docs`);
+          }
+        }
+
+        await saveModuleConfig(this.wikiDir, {
+          ...existingModuleConfig,
+          lastGeneratedAt: new Date().toISOString(),
+          lastCommit: currentCommit,
+        });
+
+        // Apply filter to module tree
+        existingMeta.moduleTree = filterModuleTree(
+          existingMeta.moduleTree,
+          existingModuleConfig.selectedModules,
+          existingModuleConfig.excludedModules,
+        );
+      }
+    }
 
     // Determine affected modules
     const affectedModules = new Set<string>();
@@ -1064,11 +1218,23 @@ export class WikiGenerator {
   }
 
   private slugify(name: string): string {
-    return name
+    // Try ASCII slug first
+    let slug = name
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '')
       .slice(0, 60);
+
+    // If empty (e.g., Chinese name), preserve Unicode characters
+    if (slug.length === 0) {
+      slug = name
+        .replace(/[\s/\\:*?"<>|]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 60);
+    }
+
+    // Fallback for edge cases
+    return slug || 'unnamed-module';
   }
 
   private async fileExists(fp: string): Promise<boolean> {
